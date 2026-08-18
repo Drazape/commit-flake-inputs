@@ -1,0 +1,240 @@
+name: "Update Flake Inputs"
+description: "Update Nix flake inputs and push a GPG-signed flake.lock commit to a target branch."
+author: "Drazape"
+
+branding:
+  icon: "refresh-cw"
+  color: "blue"
+
+inputs:
+  token:
+    description: "GitHub token used for checkout and push. Usually github.token."
+    required: true
+
+  target_branch:
+    description: "Branch that receives the lockfile update."
+    required: false
+    default: "latest"
+
+  base_ref:
+    description: "Ref used when target_branch does not exist yet. Defaults to the repository default branch."
+    required: false
+    default: ""
+
+  commit_message:
+    description: "Commit message."
+    required: false
+    default: "chore(flake): ops: update inputs"
+
+  flake_directory:
+    description: "Directory containing flake.nix, relative to repository root."
+    required: false
+    default: "."
+
+  gpg_private_key:
+    description: "ASCII-armored GPG private key."
+    required: true
+
+  gpg_passphrase:
+    description: "GPG passphrase. Leave empty if the key is not protected."
+    required: false
+    default: ""
+
+  git_user_name:
+    description: "Git user.name for the commit."
+    required: true
+
+  git_user_email:
+    description: "Git user.email for the commit."
+    required: true
+
+  gpg_signing_key:
+    description: "Optional signing key fingerprint or key ID. Useful when signing with a subkey."
+    required: false
+    default: ""
+
+  install_nix:
+    description: "Install Nix on the runner. Set to false if Nix is already available."
+    required: false
+    default: "true"
+
+  nix_extra_conf:
+    description: "Extra nix.conf configuration."
+    required: false
+    default: |
+      experimental-features = nix-command flakes
+
+outputs:
+  changed:
+    description: "true when flake.lock changed and a commit was pushed."
+    value: ${{ steps.update_commit.outputs.changed }}
+
+  commit_sha:
+    description: "HEAD SHA after the update step. Meaningful when changed is true."
+    value: ${{ steps.update_commit.outputs.commit_sha }}
+
+  target_branch:
+    description: "Branch that was targeted."
+    value: ${{ inputs.target_branch }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Configure Git safety
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -n "${GITHUB_WORKSPACE:-}" ]; then
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+        fi
+
+    - name: Validate target branch
+      shell: bash
+      env:
+        TARGET_BRANCH: ${{ inputs.target_branch }}
+      run: |
+        set -euo pipefail
+
+        : "${TARGET_BRANCH:?target_branch input must not be empty}"
+        git check-ref-format --branch "$TARGET_BRANCH"
+
+    - name: Determine base ref
+      id: base
+      shell: bash
+      env:
+        INPUT_BASE_REF: ${{ inputs.base_ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        set -euo pipefail
+
+        ref="${INPUT_BASE_REF:-$DEFAULT_BRANCH}"
+
+        if [ -z "$ref" ]; then
+          ref="${GITHUB_REF_NAME:-}"
+        fi
+
+        if [ -z "$ref" ]; then
+          echo "::error::Could not determine base_ref"
+          exit 1
+        fi
+
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+    - name: Checkout repository
+      uses: actions/checkout@v6
+      with:
+        ref: ${{ steps.base.outputs.ref }}
+        fetch-depth: 0
+        token: ${{ inputs.token }}
+        persist-credentials: true
+
+    - name: Prepare target branch
+      shell: bash
+      env:
+        TARGET_BRANCH: ${{ inputs.target_branch }}
+        GIT_TERMINAL_PROMPT: "0"
+      run: |
+        set -euo pipefail
+
+        if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null; then
+          git fetch origin "+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}"
+          git checkout -B "$TARGET_BRANCH" "refs/remotes/origin/${TARGET_BRANCH}"
+        else
+          git checkout -b "$TARGET_BRANCH"
+        fi
+
+    - name: Import GPG key
+      uses: crazy-max/ghaction-import-gpg@v7
+      with:
+        gpg_private_key: ${{ inputs.gpg_private_key }}
+        passphrase: ${{ inputs.gpg_passphrase }}
+        git_config_global: true
+        git_user_signingkey: true
+        git_commit_gpgsign: true
+        git_committer_name: ${{ inputs.git_user_name }}
+        git_committer_email: ${{ inputs.git_user_email }}
+
+    - name: Install Nix
+      if: ${{ inputs.install_nix == 'true' }}
+      uses: DeterminateSystems/nix-installer-action@v22
+      with:
+        extra-conf: ${{ inputs.nix_extra_conf }}
+
+    - name: Update flake and commit lockfile
+      id: update_commit
+      shell: bash
+      env:
+        TARGET_BRANCH: ${{ inputs.target_branch }}
+        COMMIT_MESSAGE: ${{ inputs.commit_message }}
+        FLAKE_DIRECTORY: ${{ inputs.flake_directory }}
+        GIT_USER_NAME: ${{ inputs.git_user_name }}
+        GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+        GPG_SIGNING_KEY_OVERRIDE: ${{ inputs.gpg_signing_key }}
+        NIX_CONFIG: ${{ inputs.nix_extra_conf }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GIT_TERMINAL_PROMPT: "0"
+      run: |
+        set -euo pipefail
+
+        : "${TARGET_BRANCH:?target_branch input must not be empty}"
+        : "${COMMIT_MESSAGE:?commit_message input must not be empty}"
+        : "${GIT_USER_NAME:?git_user_name input must not be empty}"
+        : "${GIT_USER_EMAIL:?git_user_email input must not be empty}"
+
+        if ! command -v nix >/dev/null 2>&1; then
+          echo "::error::nix was not found. Set install_nix to true or provide a runner with Nix installed."
+          exit 1
+        fi
+
+        flake_dir="${FLAKE_DIRECTORY#/}"
+        flake_dir="${flake_dir#./}"
+        flake_dir="${flake_dir%/}"
+
+        if [[ "$flake_dir" == *".."* ]]; then
+          echo "::error::flake_directory must not contain '..'"
+          exit 1
+        fi
+
+        if [ -z "$flake_dir" ] || [ "$flake_dir" = "." ]; then
+          nix_dir="."
+          lock_path="flake.lock"
+        else
+          nix_dir="$flake_dir"
+          lock_path="${flake_dir}/flake.lock"
+        fi
+
+        if [ ! -f "$nix_dir/flake.nix" ]; then
+          echo "::error::No flake.nix found in '$nix_dir'"
+          exit 1
+        fi
+
+        echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+        if ! (cd "$nix_dir" && nix flake update); then
+          echo "::error::nix flake update failed"
+          exit 1
+        fi
+
+        if [ -z "$(git status --porcelain -- "$lock_path")" ]; then
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git config user.name "$GIT_USER_NAME"
+        git config user.email "$GIT_USER_EMAIL"
+
+        if [ -n "$GPG_SIGNING_KEY_OVERRIDE" ]; then
+          git config user.signingkey "$GPG_SIGNING_KEY_OVERRIDE"
+        elif ! git config --get user.signingkey >/dev/null; then
+          echo "::warning::user.signingkey is not set; Git will use the default GPG key if one exists."
+        fi
+
+        git config commit.gpgsign true
+
+        git add "$lock_path"
+        git commit -S -m "$COMMIT_MESSAGE"
+        git push origin "$TARGET_BRANCH"
+
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+        echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
