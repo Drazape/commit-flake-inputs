@@ -157,7 +157,7 @@ runs:
 
     - name: Install Nix
       if: ${{ inputs.install_nix == 'true' }}
-      uses: DeterminateSystems/nix-installer-action@v22
+      uses: DeterminateSystems/nix-installer-action@v23
       with:
         extra-conf: ${{ inputs.nix_extra_conf }}
 
